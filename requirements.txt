@@ -1,0 +1,7 @@
+ipykernel
+jupyterlab
+nasdaq-data-link
+pandas
+pyarrow
+python-dotenv
+yfinance
