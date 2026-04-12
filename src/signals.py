@@ -19,6 +19,8 @@ def signal(spread, prev_spread, upper_t, prev_upper_t):
     else:
         return 0
 
+# we should probably just start with equal weight across all
+
 def get_signals(hmm_states: pd.Series,
                 pvals: tuple,
                 vols: pd.Series,
