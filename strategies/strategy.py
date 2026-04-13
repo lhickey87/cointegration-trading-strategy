@@ -2,17 +2,18 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+#strategy will be what is holding the tickers price data
+#on top of that it should hold the performance of strategy currently
+# capital, day_ret, capital_ret, sharpe
 class Strategy:
 
-    def __init__(self):
-        self.name           = None
-
-        self.tickers         = []
+    def __init__(self, name:str):
+        self.name = None
+        self.tickers = []
         self.fitted_params_ = {}
-        
+        self.portfolio = pd.DataFrame(None,columns = ["capital", "day_ret", "day_pnl", "sharpe"])
         self.ddivf = {}
         self.vols = {}
-        # injected by Backtest
         self._current_data  = None
         self.capital = 0
 
@@ -35,19 +36,19 @@ class Strategy:
 
     def update(self, bar):
         """Online model updates every bar e.g. Kalman, DVIF."""
-        pass
+        #not sure how this would be a unified function
+        raise NotImplementedError
     
     def update_capital(self, capital: np.float):
         self.capital = capital
-
-    def on_trade_entry(self, pair, signal):
-        """Called when a position is opened."""
-        #on pair entry -> where do we actually execute the trade
-        pass
-
-    def on_trade_exit(self, pair, signal):
-        """Called when a position is closed."""
-        pass
+    
+    def update_positions(self, date, signals, weights):
+        """
+        NEED TO ENSURE that weights and signals are lined up on tickers
+        """
+        if signals.columns != weights.columns:
+            return
+        self.positions.loc[date] = (signals*weights).values
 
     def _fit(self, train_data):
         self.fit(train_data)

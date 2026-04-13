@@ -6,77 +6,8 @@ from HMM import fit_hmm, get_current_regime
 from DDIVF import DDIVF, ddivf_update, trading_ddivf
 from signals import get_zscores, get_signal, optimise_threshold
 
-def kalman_init(delta, R):
-    x = np.array([0.0, 0.0])
-    P = np.eye(2)
-    Q = delta * np.eye(2)
-    return x, P, Q
 
-def kalman_step(x, P, H, y, Q, R):
-    P = P + Q
-
-    nu = y - (H @ x)[0]
-    S  = (H @ P @ H.T)[0, 0] + R
-
-    if S <= 0:
-        return x, P, nu, S, None
-
-    K = (P @ H.T) / S
-
-    x = x + K.flatten() * nu
-
-    I_KH = np.eye(2) - K @ H
-    P    = I_KH @ P @ I_KH.T + K * R * K.T
-
-    return x, P, nu, S, K
-
-def tune_kalman_params(log_a, log_b):
-    # Starting at δ=1e-4, R=1.0 — reasonable defaults
-    x0 = [np.log(1e-4), np.log(1.0)]
-
-    # Bounds in log space
-    bounds = [
-        (np.log(1e-6), np.log(1e-1)),
-        (np.log(1e-3), np.log(100.0))
-    ]
-
-    result = minimize(
-        kalman_LL,
-        x0,
-        args=(log_a, log_b),
-        method='L-BFGS-B',
-        bounds=bounds,
-        options={'maxiter': 1000}
-    )
-
-    best_delta = np.exp(result.x[0])
-    best_R     = np.exp(result.x[1])
-
-    print(f"Optimisation converged: {result.success}")
-    print(f"Best δ: {best_delta:.2e}")
-    print(f"Best R: {best_R:.4f}")
-    print(f"Log likelihood: {-result.fun:.2f}")
-
-    return best_delta, best_R
-
-def kalman_LL(params, log_a, log_b):
-    delta = np.exp(params[0])
-    R     = np.exp(params[1])
-
-    x, P, Q = kalman_init(delta, R)
-    log_like = 0.0
-
-    for t in range(len(log_a)):
-        H       = np.array([log_b.iloc[t], 1.0])
-        y       = log_a.iloc[t]
-        x, P, nu, S, K = kalman_step(x, P, H, y, Q, R)
-
-        if S <= 0:
-            return 1e10
-
-        log_like += -0.5 * (np.log(S) + nu**2 / S)
-
-    return -log_like
+#run_formation is
 
 def run_formation(log_a, log_b):
     """
@@ -92,44 +23,6 @@ def run_formation(log_a, log_b):
     )
 
     return spread,beta_series, best_delta, best_R, x_final, P_final
-
-#so on the actual trading period we will mainyl want spread and alpha seris
-# spread -> what we use to calculate the
-# pass in two price series log_a, log_b
-def kalman_filter(log_a, log_b,
-                  delta, R,
-                  x_init = None, P_init = None):
-
-    if delta is None or R is None:
-        delta, R = tune_kalman_params(log_a, log_b)
-
-    n            = len(log_a)
-    beta_series  = np.zeros(n)
-    alpha_series = np.zeros(n)
-
-    x, P, Q = kalman_init(delta, R)
-    if P_init:
-        P = P_init.copy()
-    if x_init:
-        x = x_init.copy()
-
-    for t in range(n):
-        H          = np.array([log_b.iloc[t], 1.0])
-        y          = log_a.iloc[t]
-        x, P, nu, S, K = kalman_step(x, P, H, y, Q, R)
-
-        beta_series[t]  = x[0]
-        alpha_series[t] = x[1]
-
-    beta_series  = pd.Series(beta_series,  index=log_a.index)
-    alpha_series = pd.Series(alpha_series, index=log_a.index)
-
-    beta_lagged  = beta_series.shift(1)
-    alpha_lagged = alpha_series.shift(1)
-
-    spread = log_a - beta_lagged * log_b - alpha_lagged
-
-    return spread, beta_series, alpha_series, x, P
 
 #so now we have defined the Hidden Markov Model fitted to innovations
 # NOW we should look to find the optimal threshold for profitability
