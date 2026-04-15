@@ -39,7 +39,7 @@ class Strategy:
         #not sure how this would be a unified function
         raise NotImplementedError
     
-    def update_capital(self, capital: np.float):
+    def update_capital(self, capital: np.float64):
         self.capital = capital
     
     def update_positions(self, date, signals, weights):
@@ -55,6 +55,7 @@ class Strategy:
         self.is_fitted_ = True
 
     def evaluate(self, test_data):
+        return self._evaluate(test_data)
         return
 
     @property

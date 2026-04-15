@@ -10,5 +10,6 @@ data/
 __pycache__/
 **/__pycache__/
 *.py[cod]
+.claude/
 
 .DS_Store

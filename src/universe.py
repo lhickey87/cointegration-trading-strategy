@@ -10,10 +10,10 @@ def get_sp500_changes(file: str, start_date):
     df = df[df.index > start_date]
     return df
 
-def get_sector_map(df: pd.DataFrame):
-    return df.groupby('sector')['tickers'].apply(list).to_dict()
+def sector_map(df: pd.DataFrame):
+    return df.groupby('sector')['ticker'].apply(list).to_dict()
 
-def get_all_sp500_tickers(df: pd.DataFrame):
+def sp500_tickers(df: pd.DataFrame):
     unique_tickers = set()
     for tickers in df['tickers']:
         ticks = set(tickers)
@@ -23,8 +23,8 @@ def get_all_sp500_tickers(df: pd.DataFrame):
 
 def get_ticker_data(file: str, sp500_tickers: list[str]):
     df = pd.read_parquet(file)
-    df['ticker'] = df['ticker'].apply(lambda x: x.replace(".","-"))
-    df = df[(~df['tickers'].isna()) & (df['tickers'].isin(sp500_tickers))]
+    df = df[(~df['ticker'].isna()) & (df['ticker'].isin(sp500_tickers))]
+    # df['ticker'] = df['ticker'].apply(lambda x: x.replace(".","-"))
     df = df[df['table'] == 'SEP']
     return df
 

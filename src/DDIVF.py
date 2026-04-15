@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 #so eventually we will have to do testing to determine how often we should actually change alpha
 #should I cretae a function/class for that?
 
-def trading_ddivf(trading_window: int,
+def trading_ddivf(dates: pd.Index,
                 spreads: np.ndarray,
                 prev_vol: float,
                 mean_spread: float,
@@ -13,12 +13,12 @@ def trading_ddivf(trading_window: int,
                 rho: float):
     #we should return the vols over trading period
     #why am I blanking on this
-    S = np.zeros(trading_window)
-    for i in range(trading_window):
-        S[i] = ddivf_update(spreads[i],prev_vol,mean_spread,alpha,rho)
+    # S = np.zeros(trading_window)
+    S = np.zeros(len(dates))
+    for i in range(len(dates)):
+        S[i] = ddivf_update(spreads[i], prev_vol, alpha, mean_spread, rho)
         prev_vol = S[i]
-    return pd.Series(S)
-
+    return pd.Series(S, index=dates)
 
 def ddivf_update(new_innovation: float,
                  prev_vol: float,
@@ -41,6 +41,7 @@ def ddivf_update(new_innovation: float,
 
 #we are only REALLY concerned with prev_vol or cur_vol as measure of z-score
 def DDIVF(innovations: pd.Series, min_window: int = 10) -> tuple:
+    #instead we should be using rolling windows DDIVF
     """
     runs once each new rebalance date
     returns:
@@ -48,7 +49,6 @@ def DDIVF(innovations: pd.Series, min_window: int = 10) -> tuple:
         sigma_DD -> first rebalance day vol prediction
         S -> full vol data over reformation period
     """
-
     nu_bar     = np.mean(innovations)
     deviations = innovations - nu_bar
     signs      = np.sign(deviations)
@@ -58,7 +58,7 @@ def DDIVF(innovations: pd.Series, min_window: int = 10) -> tuple:
     if abs(rho) < 1e-6:
         rho = 0.798
 
-    V = np.abs(deviations) / rho
+    V = (np.abs(deviations) / rho).values  # numpy array — safe integer indexing throughout
     S_init = V[0]
 
     alphas    = np.arange(0.01, 0.51, 0.01)
@@ -71,7 +71,7 @@ def DDIVF(innovations: pd.Series, min_window: int = 10) -> tuple:
 
         for s in range(1, len(V)):
             one_step_error = (V[s] - S) ** 2
-            if s >= min_window:                  # only count after burn-in
+            if s >= min_window:
                 fess += one_step_error
             S = alpha * V[s] + (1 - alpha) * S
 
@@ -79,10 +79,9 @@ def DDIVF(innovations: pd.Series, min_window: int = 10) -> tuple:
             best_fess = fess
             alpha_opt = alpha
 
-#actually so we are technically
     S = [S_init]
     for s in range(1, len(V)):
         S.append(alpha_opt * V[s] + (1 - alpha_opt) * S[s-1])
     
     sigma_DD = S[-1]
-    return alpha_opt, S, sigma_DD
+    return alpha_opt, S, sigma_DD, rho
