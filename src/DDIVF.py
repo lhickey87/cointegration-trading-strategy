@@ -14,6 +14,7 @@ def trading_ddivf(dates: pd.Index,
     #we should return the vols over trading period
     #why am I blanking on this
     # S = np.zeros(trading_window)
+    #this is entirely wrong, we need to be calling each and every day
     S = np.zeros(len(dates))
     for i in range(len(dates)):
         S[i] = ddivf_update(spreads[i], prev_vol, alpha, mean_spread, rho)

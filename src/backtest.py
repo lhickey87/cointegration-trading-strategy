@@ -3,18 +3,65 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from itertools import combinations
-from kalman import kalman_filter, run_formation
 from DDIVF import DDIVF
 from HMM import fit_hmm, get_current_regime
 from signals import get_signals, optimise_threshold
 
 
-
 class Backtest():
 
-    def __init__(self, portfolio):
+    def __init__(self, portfolio, strategy):
         self.portfolio = portfolio
+        self.strategy = strategy
+   
+    def walk_forward(self, train_years: int = 2, test_years: int =1, embargo: int = 10):
+        folds = self.make_folds(train_years, test_years, embargo_days=embargo)
+        for fold in folds:
+
+            train_data = self.strategy.preprocess(fold['train'])
+            test_data = self.strategy.preproecss(fold['test'])
+
+            #this wont return anything
+            self.strategy.fit(train_data)
+
+            #now that we've preprocessed and fit do we go to evaluate?
+
+            #should call fit now
+            #that should probably strategy specific
+
+
     
+    @staticmethod
+    def make_folds(self, train_years: int = 2, test_years: int = 1, embargo_days: int = 10):
+        #the folds are meant to be dictionary of train and test
+        # when we are back testing we will iterate through the folds
+        folds = []
+        data = self.strategy.price_data
+        start = data.index[0]
+        end   = data.index[-1]
+
+        fold_start = start
+        while True:
+            train_end  = fold_start + pd.DateOffset(years=train_years)
+            test_start = train_end  + pd.DateOffset(days=embargo_days)
+            test_end   = test_start + pd.DateOffset(years=test_years)
+
+            if test_end > end:
+                break
+
+            folds.append({
+                "train": data.loc[fold_start:train_end],
+                "test":  data.loc[test_start:test_end]
+            })
+
+            fold_start = test_end  # next fold starts where test ended
+
+        return folds
+   
+    def get_groups(N, k):
+        edges = np.linspace(0, N, k+1,dtype=int)
+        return [np.arange(edges[i],edges[i+1]) for i in range(k-1)]
+        
     def plot_paths(paths, ax = None, quantiles = [0.2,0.8]):
         fig, ax = plt.subplots(figsize=(12, 4))
 
@@ -35,10 +82,7 @@ class Backtest():
         ax.set_ylabel('Cumulative Return')
         ax.legend()
         return fig, ax
-   
-    def get_groups(N, k):
-        edges = np.linspace(0, N, k+1,dtype=int)
-        return [np.arange(edges[i],edges[i+1]) for i in range(k-1)]
+ 
             
     def CPCV(N = 5, k = 2, embargo = 5):
         #this could be many different stocks?

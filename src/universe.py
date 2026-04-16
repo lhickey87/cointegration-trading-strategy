@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
 
+#issue is we have to be doing this for most of kalman 
+
+
+#get tickers throughought time period -> from those tickers get sector_map
 
 def get_sp500_changes(file: str, start_date):
     df = pd.read_csv(file)
@@ -10,8 +14,9 @@ def get_sp500_changes(file: str, start_date):
     df = df[df.index > start_date]
     return df
 
-def sector_map(df: pd.DataFrame):
-    return df.groupby('sector')['ticker'].apply(list).to_dict()
+def sector_map(tickers:list, company_df: pd.DataFrame):
+    df = company_df[company_df['tickers'].isin(tickers)]
+    return df.groupby('sector').apply(list).to_dict()
 
 def sp500_tickers(df: pd.DataFrame):
     unique_tickers = set()

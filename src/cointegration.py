@@ -14,6 +14,10 @@ def is_I1(series: pd.Series, p_threshold: float = 0.1) -> bool:
     p_diff  = adfuller(series.diff().dropna(), autolag='AIC')[1]
     return (p_level > p_threshold) and (p_diff <= p_threshold)
 
+#well here we 
+def get_pairs_at_date(date_range):
+    pass
+
 def compute_beta(log_dep: pd.Series, log_indep: pd.Series) -> float:
     """OLS hedge ratio: slope from regressing log_dep on log_indep."""
     return np.cov(log_dep, log_indep)[0, 1] / np.var(log_indep)

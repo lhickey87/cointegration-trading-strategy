@@ -7,8 +7,9 @@ import matplotlib.pyplot as plt
 # capital, day_ret, capital_ret, sharpe
 class Strategy:
 
-    def __init__(self, name:str):
-        self.name = None
+    def __init__(self, name:str, price_data: pd.DataFrame):
+        self.name = name
+        self.price_data = price_data
         self.tickers = []
         self.fitted_params_ = {}
         self.portfolio = pd.DataFrame(None,columns = ["capital", "day_ret", "day_pnl", "sharpe"])
@@ -17,10 +18,18 @@ class Strategy:
         self._current_data  = None
         self.capital = 0
 
-    def fit(self, train_data):
+    def fit(self, train_data, sector_map):
         """Prepare the strategy on training data — pair selection, parameter 
     estimation, threshold calibration. No ML required."""
         raise NotImplementedError
+    
+    def preprocess(self):
+        raise NotImplementedError
+    
+    def evaluate(self, test_data):
+        if not getattr(self, 'is_fitted', False):
+            raise RuntimeError("Must call fit() before evaluate()")
+        return self._evaluate(test_data)
     
     def initialize_positions(self, df: pd.DataFrame):
         """Class specific for position logic -> which tickers -> if pairs we can specify"""
@@ -50,13 +59,8 @@ class Strategy:
             return
         self.positions.loc[date] = (signals*weights).values
 
-    def _fit(self, train_data):
-        self.fit(train_data)
-        self.is_fitted_ = True
-
     def evaluate(self, test_data):
         return self._evaluate(test_data)
-        return
 
     @property
     def get_capital(self):

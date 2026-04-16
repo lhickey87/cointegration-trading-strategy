@@ -65,16 +65,23 @@ def optimise_threshold(innovations: pd.Series,
                        k: int = 100,
                        n_states: int = 2):
 
-    # next bar's return: signal at close of t, P&L realised at close of t+1
-    delta_y = log_y.diff().shift(-1)
-    delta_x = log_x.diff().shift(-1)
+    # align everything to sigma_dd's index (which already starts at bar k
+    # after the rolling burn-in — no need for explicit iloc[k:] slices)
+    idx          = sigma_dd.index
+    innovations  = innovations.reindex(idx)
+    hmm_states   = hmm_states.reindex(idx)
 
-    thresholds = np.linspace(0.5, 2.5, 11)
+    beta         = beta.reindex(idx)
+
+    delta_y      = log_y.reindex(idx).diff().shift(-1)
+    delta_x      = log_x.reindex(idx).diff().shift(-1)
+
+    thresholds = np.linspace(0.5, 2.5, 21)
     combs      = list(product(thresholds, repeat=n_states))
 
     best_sharpe = 0
-    best_pvals         = None
-    results            = {}
+    best_pvals  = None
+    results     = {}
 
     for state_thresholds in combs:
 
@@ -85,10 +92,9 @@ def optimise_threshold(innovations: pd.Series,
             spreads  = innovations
         )
 
-        signals   = signals.iloc[k:]
-        beta_t    = beta.iloc[k:]
-        delta_y_t = delta_y.iloc[k:]
-        delta_x_t = delta_x.iloc[k:]
+        beta_t    = beta
+        delta_y_t = delta_y
+        delta_x_t = delta_x
 
         # signal at t → P&L from t to t+1 (delta already shifted one step ahead)
         position_y = signals
@@ -97,9 +103,11 @@ def optimise_threshold(innovations: pd.Series,
         pnl = (position_y * delta_y_t + position_x * delta_x_t).dropna()
 
         mask = pnl != 0
+
         trade_ids = (mask & ~mask.shift(fill_value=False)).cumsum()
         trade_ids = trade_ids.where(mask)
         trade_ids = trade_ids[~trade_ids.isna()]
+
         pnl_active = pnl.reindex(trade_ids.index)
 
         trade_returns = pnl_active.groupby(trade_ids).sum()
@@ -120,5 +128,5 @@ def optimise_threshold(innovations: pd.Series,
             best_sharpe = sharpe
             best_pvals  = {s: state_thresholds[s] for s in range(n_states)}
 
-    return best_pvals, best_profit_factor, results
+    return best_pvals, best_sharpe, results
 
