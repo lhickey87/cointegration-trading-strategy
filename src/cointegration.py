@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from itertools import combinations
+from concurrent.futures import ProcessPoolExecutor
 from statsmodels.tsa.stattools import adfuller, coint
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools.tools import add_constant
@@ -31,33 +32,40 @@ def half_life(spread: pd.Series) -> float:
     lam = OLS(diff, add_constant(lag)).fit().params.iloc[1]
     return -np.log(2) / lam if lam < 0 else np.inf
 
+def _test_pair(args):
+    """Module-level wrapper so ProcessPoolExecutor can pickle it."""
+    prices, x, y, sector = args
+    r = test_cointegration(prices, x, y)
+    return {**r, 'sector': sector} if r is not None else None
+
+
 def test_cointegration(prices: pd.DataFrame,
                        ticker_a: str,
                        ticker_b: str) -> dict | None:
-    log_a = np.log(prices[ticker_a].dropna())
-    log_b = np.log(prices[ticker_b].dropna())
-    both  = pd.concat([log_a, log_b], axis=1).dropna()
+    log_y = np.log(prices[ticker_a].dropna())
+    log_x = np.log(prices[ticker_b].dropna())
+    both  = pd.concat([log_y, log_x], axis=1).dropna()
 
     if len(both) < 60:
         return None
 
-    log_a, log_b = both.iloc[:, 0], both.iloc[:, 1]
+    log_y, log_x = both.iloc[:, 0], both.iloc[:, 1]
 
-    if not is_I1(log_a) or not is_I1(log_b):
+    if not is_I1(log_y) or not is_I1(log_x):
         return None
 
-    beta_ab = compute_beta(log_a, log_b)
-    beta_ba = compute_beta(log_b, log_a)
-    hl_ab   = half_life(log_a - beta_ab * log_b)
-    hl_ba   = half_life(log_b - beta_ba * log_a)
+    beta_ab = compute_beta(log_y, log_x)
+    beta_ba = compute_beta(log_x, log_y)
+    hl_ab   = half_life(log_y - beta_ab * log_x)
+    hl_ba   = half_life(log_x - beta_ba * log_y)
 
     if hl_ab <= hl_ba:
         dep, indep     = ticker_a, ticker_b
-        log_dep, log_indep = log_a, log_b
+        log_dep, log_indep = log_y, log_x
         beta, hl       = beta_ab, hl_ab
     else:
         dep, indep     = ticker_b, ticker_a
-        log_dep, log_indep = log_b, log_a
+        log_dep, log_indep = log_x, log_y
         beta, hl       = beta_ba, hl_ba
 
     _, pvalue, _ = coint(log_dep, log_indep)
@@ -78,22 +86,32 @@ def test_cointegration(prices: pd.DataFrame,
         'pvalue':      round(pvalue, 4),
     }
 
-def _filter_by_correlation(log_prices: pd.DataFrame,
+def get_correlation(log_y, log_x):
+    return np.corrcoef(log_y, log_x)[0,1]
+
+def _filter_by_correlation(df: pd.DataFrame,
                             sector_map: dict,
                             threshold: float) -> dict[str, pd.DataFrame]:
-    """Returns sector -> DataFrame of (stock1, stock2) pairs passing correlation threshold."""
     combs_map = {}
     for sector, tickers in sector_map.items():
-        combs = pd.DataFrame(combinations(tickers, 2), columns=['stock1', 'stock2'])
-        combs['corr'] = combs.apply(
-            lambda row: log_prices[row['stock1']].corr(log_prices[row['stock2']]),
-            axis=1
-        )
-        combs = combs[abs(combs['corr']) >= threshold].reset_index(drop=True)
-        if not combs.empty:
-            combs_map[sector] = combs
-    return combs_map
 
+        corr_matrix = df[tickers].corr()
+
+        # upper triangle only → no duplicate pairs, no self-pairs
+        mask = np.triu(np.ones(corr_matrix.shape, dtype=bool), k=1)
+        #.where(mask) -> 
+        corr_matrix.index.name   = 'stock1'
+        corr_matrix.columns.name = 'stock2'
+        pairs = (corr_matrix.where(mask)
+                             .stack()
+                             .reset_index()
+                             .set_axis(['stock1', 'stock2', 'corr'], axis=1))
+        pairs = pairs[pairs['corr'].abs() >= threshold].reset_index(drop=True)
+
+        if not pairs.empty:
+            combs_map[sector] = pairs
+
+    return combs_map
 
 def filter_by_pvalue(pairs: pd.DataFrame, alpha: float = 0.025) -> pd.DataFrame:
     """Filter pairs by EG p-value and rank by strength of cointegration."""
@@ -101,6 +119,7 @@ def filter_by_pvalue(pairs: pd.DataFrame, alpha: float = 0.025) -> pd.DataFrame:
 
 #only thing is that alot of this does assume price_matrix is 
 
+#did I pass in company_df instead of price_matrix
 def combination_filter(price_matrix: pd.DataFrame,
                        sector_map: dict,
                        corr_threshold: float = 0.65,
@@ -110,10 +129,10 @@ def combination_filter(price_matrix: pd.DataFrame,
       1. Correlation pre-filter (same sector only)
       2. Cointegration test on each correlated pair
       3. FDR correction across all surviving pairs
-
     Returns a DataFrame of validated pairs with columns:
       dependent, independent, beta, half_life, pvalue, sector
     """
+
     log_prices = np.log(price_matrix)
     combs_map  = _filter_by_correlation(log_prices, sector_map, corr_threshold)
 
@@ -124,13 +143,14 @@ def combination_filter(price_matrix: pd.DataFrame,
     n_corr = sum(len(df) for df in combs_map.values())
     print(f"After correlation filter:    {n_corr} pairs")
 
-    rows = []
-    for sector, df in combs_map.items():
-        results = df.apply(
-            lambda row: test_cointegration(price_matrix, row['stock1'], row['stock2']),
-            axis=1
-        ).dropna().tolist()
-        rows.extend([{**r, 'sector': sector} for r in results])
+    tasks = [
+        (price_matrix, x, y, sector)
+        for sector, df in combs_map.items()
+        for x, y in zip(df['stock1'], df['stock2'])
+    ]
+
+    with ProcessPoolExecutor() as executor:
+        rows = [r for r in executor.map(_test_pair, tasks) if r is not None]
 
     print(f"After cointegration tests:   {len(rows)} pairs")
 

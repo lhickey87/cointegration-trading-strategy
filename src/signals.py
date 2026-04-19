@@ -1,132 +1,102 @@
-
+import warnings
 import pandas as pd
 import numpy as np
 from itertools import product
-from plotting import plot_params
+from numba import njit
 
-from statsmodels.tools.typing import NDArray
+@njit
+def _shift(arr):
+    out    = np.empty_like(arr)
+    out[0] = arr[0]
+    out[1:] = arr[:-1]
+    return out
 
-def get_zscores(vols: np.ndarray, innovations: np.ndarray):
-    mean_in = np.mean(innovations)
-    #what do we even do with vols?
-    return (innovations-mean_in)/vols
+#should also probably look into the performance across different stop_z and exit_z
 
-def signal(spread, prev_spread, upper_t, prev_upper_t):
-    if spread > upper_t and prev_spread < prev_upper_t:
-            return -1
-    elif spread < -upper_t and prev_spread > -prev_upper_t:
-        return 1
-    else:
-        return 0
+@njit
+def get_signals(hmm_vals, pvals, vols, spreads, stop_z=4, exit_z=0.5):
+    hmm_prev         = _shift(hmm_vals)
+    vols_prev        = _shift(vols)
 
-# we should probably just start with equal weight across all
+    threshold_t      = pvals[hmm_vals]
+    threshold_prev_t = pvals[hmm_prev]
 
-#this gives us the signals for the entire trading period
-def get_signals(pair_hmm: pd.Series,
-                pvals: tuple,
-                vols: pd.Series,
-                spreads: pd.Series,
-                stop_z: int = 3.5,
-                exit_z: int = 0.5):
+    upper_t          = threshold_t * vols
+    upper_prev_t     = threshold_prev_t * vols_prev
 
-    threshold_t      = pair_hmm.map(lambda r: pvals[int(r)] if pd.notna(r) else np.nan)
-    threshold_prev_t = pair_hmm.shift(1).map(lambda r: pvals[int(r)] if pd.notna(r) else np.nan)
+    exit_band        = exit_z * vols
+    stop_band        = stop_z * vols
 
-    upper_t      = (threshold_t      * vols).values
-    upper_prev_t = (threshold_prev_t * vols.shift(1)).values
-    exit_band    = (exit_z * vols).values
-    stop_band    = (stop_z * vols).values
-    s            = spreads.values
+    position = 0
+    out = np.zeros(len(spreads), dtype=np.int8)
 
-    position  = 0
-    out       = np.zeros(len(s), dtype=int)
-
-    for i in range(1, len(s)):
+    for i in range(1, len(spreads)):
         if position != 0:
-            if abs(s[i]) < exit_band[i] or abs(s[i]) > stop_band[i]:
+            if abs(spreads[i]) < exit_band[i] or abs(spreads[i]) > stop_band[i]:
                 position = 0
         else:
-            if s[i] > upper_t[i] and s[i - 1] < upper_prev_t[i]:
+            if spreads[i] > upper_t[i] and spreads[i-1] < upper_prev_t[i]:
                 position = -1
-            elif s[i] < -upper_t[i] and s[i - 1] > -upper_prev_t[i]:
+            elif spreads[i] < -upper_t[i] and spreads[i-1] > -upper_prev_t[i]:
                 position = 1
         out[i] = position
 
-    return pd.Series(out, index=spreads.index)
+    return out
 
-#threshold is related to the hidden markov state of the model
-#this is incredibly slow -> have to call this on every single 
-def optimise_threshold(innovations: pd.Series,
-                       sigma_dd: pd.Series,
-                       hmm_states: pd.Series,
-                       log_y: pd.Series,
-                       log_x: pd.Series,
-                       beta: pd.Series,
-                       k: int = 100,
-                       n_states: int = 2):
+def _align_index(innovations, sigma_dd, hmm_states, log_y, log_x, beta):
+    idx = sigma_dd.index
+    return (
+        innovations.reindex(idx),
+        hmm_states.reindex(idx),
+        beta.reindex(idx),
+        log_y.reindex(idx).diff().shift(-1),
+        log_x.reindex(idx).diff().shift(-1),
+    )
 
-    # align everything to sigma_dd's index (which already starts at bar k
-    # after the rolling burn-in — no need for explicit iloc[k:] slices)
-    idx          = sigma_dd.index
-    innovations  = innovations.reindex(idx)
-    hmm_states   = hmm_states.reindex(idx)
-
-    beta         = beta.reindex(idx)
-
-    delta_y      = log_y.reindex(idx).diff().shift(-1)
-    delta_x      = log_x.reindex(idx).diff().shift(-1)
-
-    thresholds = np.linspace(0.5, 2.5, 21)
-    combs      = list(product(thresholds, repeat=n_states))
-
-    best_sharpe = 0
-    best_pvals  = None
-    results     = {}
-
-    for state_thresholds in combs:
-
-        signals = get_signals(
-            pair_hmm = hmm_states,
-            pvals    = state_thresholds,
-            vols     = sigma_dd,
-            spreads  = innovations
+def optimise_threshold(innovations, sigma_dd, hmm_states, log_y, log_x, beta, k=100, n_states=2):
+    innovations, hmm_states, beta, delta_y, delta_x = _align_index(
+        innovations, sigma_dd,hmm_states, log_y, log_x, beta
         )
+    
+    valid       = delta_y.notna() & delta_x.notna()
 
-        beta_t    = beta
-        delta_y_t = delta_y
-        delta_x_t = delta_x
+    delta_y_arr = delta_y[valid].values
+    delta_x_arr = delta_x[valid].values
+    beta_arr    = beta[valid].values
+    hmm_vals    = hmm_states[valid].values.astype(int)
 
-        # signal at t → P&L from t to t+1 (delta already shifted one step ahead)
-        position_y = signals
-        position_x = -beta_t * signals
+    vols_arr    = sigma_dd.reindex(innovations[valid].index).values
+    spreads_arr = innovations[valid].values
 
-        pnl = (position_y * delta_y_t + position_x * delta_x_t).dropna()
+    combs = list(product(np.linspace(0.5, 2.5, 21), repeat=n_states))
+    K, N  = len(combs), len(spreads_arr)
 
-        mask = pnl != 0
+    signals_matrix = np.zeros((K, N), dtype=np.int8)
+    for ki, state_thresholds in enumerate(combs):
+        signals_matrix[ki] = get_signals(hmm_vals, np.array(state_thresholds),
+                                         vols_arr, spreads_arr)
 
-        trade_ids = (mask & ~mask.shift(fill_value=False)).cumsum()
-        trade_ids = trade_ids.where(mask)
-        trade_ids = trade_ids[~trade_ids.isna()]
+    pnl = (signals_matrix * delta_y_arr + (-beta_arr * signals_matrix) * delta_x_arr) / (1 + beta_arr)
 
-        pnl_active = pnl.reindex(trade_ids.index)
+    active = signals_matrix != 0
+    pnl_active = np.where(active, pnl, np.nan)
 
-        trade_returns = pnl_active.groupby(trade_ids).sum()
+    with np.errstate(invalid='ignore', divide='ignore'), \
+         warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        sharpes = np.nanmean(pnl_active, axis=1) / np.nanstd(pnl_active, axis=1, ddof=1) * np.sqrt(252)
 
-        if len(trade_returns) < 20:
-            continue
-            
-        # gross_wins   = trade_returns[trade_returns > 0].sum()
-        # gross_losses = trade_returns[trade_returns < 0].sum()
-        #should probably optimize sharpe over profit_factor
-        # profit_factor = gross_wins / abs(gross_losses) if gross_losses < 0 else np.inf
-        sharpe = trade_returns.mean() / trade_returns.std()*np.sqrt(252)
+    sharpes[active.sum(axis=1) < 20] = -np.inf
 
-        key = (round(state_thresholds[0],2),round(state_thresholds[1],2))
-        results[key] = sharpe
+    best_idx   = np.argmax(sharpes)
+    best_pvals = np.array(combs[best_idx])
+    results    = {tuple(round(t, 2) for t in c): s for c, s in zip(combs, sharpes)}
 
-        if sharpe > best_sharpe:
-            best_sharpe = sharpe
-            best_pvals  = {s: state_thresholds[s] for s in range(n_states)}
+    return best_pvals, float(sharpes[best_idx]), results
 
-    return best_pvals, best_sharpe, results
+_dummy_hmm    = np.zeros(10, dtype=np.int64)
+_dummy_pvals  = np.array([1.0, 1.5])
+_dummy_vols   = np.ones(10)
+_dummy_spread = np.zeros(10)
+get_signals(_dummy_hmm, _dummy_pvals, _dummy_vols, _dummy_spread)
 

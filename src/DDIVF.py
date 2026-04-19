@@ -1,88 +1,65 @@
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from numba import njit
 
-#so eventually we will have to do testing to determine how often we should actually change alpha
-#should I cretae a function/class for that?
 
-def trading_ddivf(dates: pd.Index,
-                spreads: np.ndarray,
-                prev_vol: float,
-                mean_spread: float,
-                alpha: float,
-                rho: float):
-    #we should return the vols over trading period
-    #why am I blanking on this
-    # S = np.zeros(trading_window)
-    #this is entirely wrong, we need to be calling each and every day
-    S = np.zeros(len(dates))
-    for i in range(len(dates)):
-        S[i] = ddivf_update(spreads[i], prev_vol, alpha, mean_spread, rho)
-        prev_vol = S[i]
-    return pd.Series(S, index=dates)
+def get_rho(deviations: np.ndarray, signs: np.ndarray) -> float:
+    d = deviations - deviations.mean()
+    s = signs - signs.mean()
+    denom = len(d) * d.std() * s.std()
+    if denom == 0:
+        return 0.798
+    return np.dot(d, s) / denom
 
-def ddivf_update(new_innovation: float,
-                 prev_vol: float,
-                 alpha: float,
-                 mean_innovation: float,
-                 rho: float) -> float:
-    """
-    Lightweight daily update — no optimisation needed.
-    Just applies the pre-optimised alpha_opt to update the EWMA.
 
-    new_innovation: today's ν_t from Kalman filter
-    prev_sigma_dd:  yesterday's σ̂^DD_{t-1}
-    alpha_opt:      optimised on formation window, fixed
-    nu_bar:         innovation mean from formation window, fixed
-    rho:            sign correlation from formation window, fixed
-    """
-    V_t = abs(new_innovation-mean_innovation)/rho
-    S = alpha*prev_vol+(1-alpha)*V_t
+@njit
+def ddivf_core(V: np.ndarray, alphas: np.ndarray, min_window: int) -> float:
+    best_fess = 1e18
+    alpha_opt = alphas[0]
+    for ai in range(len(alphas)):
+        S    = V[0]
+        fess = 0.0
+        for t in range(1, len(V)):
+            err = (V[t] - S) ** 2
+            if t >= min_window:
+                fess += err
+            S = alphas[ai] * V[t] + (1 - alphas[ai]) * S
+        if fess < best_fess:
+            best_fess = fess
+            alpha_opt = alphas[ai]
+    return alpha_opt
+
+
+@njit
+def _reconstruct(V: np.ndarray, alpha: float) -> np.ndarray:
+    """Reconstruct vol series with optimal alpha — JIT compiled."""
+    S    = np.empty(len(V))
+    S[0] = V[0]
+    for t in range(1, len(V)):
+        S[t] = alpha * V[t] + (1 - alpha) * S[t - 1]
     return S
 
-#we are only REALLY concerned with prev_vol or cur_vol as measure of z-score
-def DDIVF(innovations: pd.Series, min_window: int = 10) -> tuple:
-    #instead we should be using rolling windows DDIVF
-    """
-    runs once each new rebalance date
-    returns:
-        optimal_alpha -> alpha that minimizes vol prediction error
-        sigma_DD -> first rebalance day vol prediction
-        S -> full vol data over reformation period
-    """
+def DDIVF(innovations: np.ndarray, min_window: int = 10) -> tuple:
     nu_bar     = np.mean(innovations)
     deviations = innovations - nu_bar
     signs      = np.sign(deviations)
-    mask       = signs != 0
-    rho        = np.corrcoef(deviations[mask], signs[mask])[0, 1]
-
-    if abs(rho) < 1e-6:
+    mask = signs != 0
+    if mask.sum() < 2:
         rho = 0.798
+    else:
+        rho = get_rho(deviations[mask], signs[mask])
+        if abs(rho) < 1e-6:
+            rho = 0.798
 
-    V = (np.abs(deviations) / rho).values  # numpy array — safe integer indexing throughout
-    S_init = V[0]
-
+    V         = np.abs(deviations) / rho
     alphas    = np.arange(0.01, 0.51, 0.01)
-    best_fess = np.inf
-    alpha_opt = 0.1
+    alpha_opt = ddivf_core(V, alphas, min_window)
+    S         = _reconstruct(V, alpha_opt)
 
-    for alpha in alphas:
-        S    = S_init
-        fess = 0.0
+    return alpha_opt, S, S[-1], rho
 
-        for s in range(1, len(V)):
-            one_step_error = (V[s] - S) ** 2
-            if s >= min_window:
-                fess += one_step_error
-            S = alpha * V[s] + (1 - alpha) * S
 
-        if fess < best_fess:
-            best_fess = fess
-            alpha_opt = alpha
-
-    S = [S_init]
-    for s in range(1, len(V)):
-        S.append(alpha_opt * V[s] + (1 - alpha_opt) * S[s-1])
-    
-    sigma_DD = S[-1]
-    return alpha_opt, S, sigma_DD, rho
+# ── JIT warmup — triggers compilation on import, not on first real call ──
+_dummy_V      = np.ones(10, dtype=np.float64)
+_dummy_alphas = np.arange(0.01, 0.51, 0.01)
+ddivf_core(_dummy_V, _dummy_alphas, 5)
+_reconstruct(_dummy_V, 0.1)

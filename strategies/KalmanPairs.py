@@ -8,38 +8,31 @@ from strategy import Strategy
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cointegration import combination_filter
 from HMM import fit_hmm, get_current_regime
-from DDIVF import DDIVF, trading_ddivf
+from DDIVF import DDIVF
 from signals import optimise_threshold, get_signals
-from universe import sector_map
-
+from universe import get_sector_map
+from numba import njit
 
 def entry_beta(signals: pd.Series, betas: pd.Series) -> pd.Series:
-    """Returns the beta locked in at the start of each trade, held constant 
-    for the duration of the position. Zero when flat."""
-    result     = pd.Series(0.0, index=signals.index)
-    in_pos     = (signals != 0)
-    is_entry   = in_pos & ~in_pos.shift(1, fill_value=False)
-    group_ids  = is_entry.cumsum().where(in_pos)
-
-    for gid, group in group_ids.groupby(group_ids):
+    """Beta locked in at trade entry, held constant for the duration."""
+    result    = pd.Series(0.0, index=signals.index)
+    in_pos    = signals != 0
+    is_entry  = in_pos & ~in_pos.shift(1, fill_value=False)
+    group_ids = is_entry.cumsum().where(in_pos)
+    for _, group in group_ids.groupby(group_ids):
         result.loc[group.index] = betas.loc[group.index[0]]
-
     return result
 
 def pair_col(pair: tuple[str, str]) -> str:
-    """Tuple pair → DataFrame column string ('AAPL', 'MSFT') → 'AAPL/MSFT'."""
     return f"{pair[0]}/{pair[1]}"
 
 def col_to_pair(col: str) -> tuple[str, str]:
-    """DataFrame column string → tuple pair 'AAPL/MSFT' → ('AAPL', 'MSFT')."""
     y, x = col.split('/')
     return (y, x)
 
-def match_index(log_y, log_x):
-        comb = pd.concat([log_y,log_x],axis=1).dropna()
-        log_y = comb.iloc[:,0]
-        log_x = comb.iloc[:,1]
-        return log_y, log_x
+def match_index(log_y: pd.Series, log_x: pd.Series) -> tuple[pd.Series, pd.Series]:
+    combined = pd.concat([log_y, log_x], axis=1).dropna()
+    return combined.iloc[:, 0], combined.iloc[:, 1]
 
 @dataclass
 class DDIVFState:
@@ -48,57 +41,69 @@ class DDIVFState:
     rho:        float
     vol:        float
     train_vols: pd.Series
-    buffer:     np.ndarray    # last k innovations from training
+    buffer:     np.ndarray
+
+@dataclass
+class KalmanConfig:
+    ewm_halflife:        int             = 20
+    optimise_thresholds: bool            = True
+    thresholds:          tuple[float, float] = (0.7, 1.5)  # fallback / fixed thresholds
 
 @dataclass
 class KFState:
-    x:     np.ndarray  # [beta, alpha]
-    P:     np.ndarray  # 2×2 covariance
-    Q:     np.ndarray  # process noise (delta * I)
-    R:     float       # observation noise variance
-    delta: float       # stored so filter can resume after formation window
+    x:     np.ndarray   # [beta, alpha]
+    P:     np.ndarray   # 2×2 covariance
+    Q:     np.ndarray   # process noise
+    R:     float        # observation noise variance
+    delta: float
 
-#so now what we need to do is get sectors_map, then also figure out our data
+@njit
+def _kalman_ll_core(log_y: np.ndarray, log_x: np.ndarray, delta: float, R: float) -> float:
+    x, P, Q, ll = np.zeros(2), np.eye(2), delta * np.eye(2), 0.0
+    for t in range(len(log_y)):
+        H  = np.array([log_x[t], 1.0])
+        P  = P + Q
+        nu = log_y[t] - H @ x
+        S  = H @ P @ H + R
+        if S <= 0:
+            return 1e10
+        K  = (P @ H) / S
+        x  = x + K * nu
+        P  = (np.eye(2) - np.outer(K, H)) @ P
+        ll += -0.5 * (np.log(S) + nu ** 2 / S)
+    return -ll
+
+_kalman_ll_core(np.ones(10, dtype=np.float64), np.ones(10, dtype=np.float64), 1e-4, 1.0)  # warmup
+
 class KalmanPairs(Strategy):
 
     def __init__(self, price_data: pd.DataFrame, company_df: pd.DataFrame):
         super().__init__(name="pairs", price_data=price_data)
-        self.trading_days = len(price_data.index)
-        self.company_df = company_df
-        #this should probably be throughouit time
-        self.pairs:       list[tuple]          = []
-        self.kf_states:   dict[tuple, KFState] = {}
-        self.spreads:     pd.DataFrame         = pd.DataFrame()  # training spreads
-        self.is_fitted: bool = False
-        
-        # TESTING
-        self.test_spreads: pd.DataFrame        = pd.DataFrame()  # evaluation spreads
-        self.test_betas:   pd.DataFrame        = pd.DataFrame()  # evaluation betas
-        self.test_alphas:  pd.DataFrame        = pd.DataFrame()  # evaluation alphas
-        self.regimes: pd.DataFrame = pd.DataFrame()
-        self.vols: pd.DataFrame = pd.DataFrame()
+        self.company_df    = company_df
+        self.config        = KalmanConfig()
+        self.pairs:        list[tuple]             = []
+        self.kf_states:    dict[tuple, KFState]    = {}
+        self.train_betas:  dict[tuple, pd.Series]  = {}
+        self.train_alphas: dict[tuple, pd.Series]  = {}
+        self.ddivf_states: dict[tuple, DDIVFState] = {}
+        self.hmm_models:   dict                    = {}
+        self.thresholds:   dict[tuple, np.ndarray] = {}
+        self.profit_factor: dict                   = {}
+        self.spreads:      pd.DataFrame = pd.DataFrame()
+        self.test_spreads: pd.DataFrame = pd.DataFrame()
+        self.test_betas:   pd.DataFrame = pd.DataFrame()
+        self.test_alphas:  pd.DataFrame = pd.DataFrame()
+        self.regimes:      pd.DataFrame = pd.DataFrame()
+        self.vols:         pd.DataFrame = pd.DataFrame()
+        self.is_fitted:    bool         = False
 
-        # TRAINING
-        self.train_betas: dict = {}
-        self.train_alphas: dict = {}
-        self.ddivf_states: dict = {}
-        self.hmm_models: dict  = {}
-        self.thresholds: dict  = {}
-        self.profit_factor: dict = {}
-    
-    def __repr__(self):
-        pass 
-    
     def __str__(self):
         return f"KalmanPairs strategy with {len(self.pairs)} active pairs"
-    
-    def __len__(self):
-        return len(self.pairs)
-    
+
     @property
-    def trading_days(self):
+    def trading_days(self) -> int:
         return len(self.price_data.index)
-    
+
     @property
     def betas(self) -> dict:
         return {pair: state.x[0] for pair, state in self.kf_states.items()}
@@ -106,249 +111,223 @@ class KalmanPairs(Strategy):
     @property
     def alphas(self) -> dict:
         return {pair: state.x[1] for pair, state in self.kf_states.items()}
-    
 
-    def preprocess(self, df: pd.DataFrame):
-        df = df.dropna(axis=1, how='all')
-        #now once we've preprocessed what else?
-        return df
-
-    #call fit on each fold on train_data
-    #after preprocess we get the tickers from the data
-    # then we get the sector_map
-    # 3. we reinitialize self.pairs from the new sector_map and train_data
-    # 4. we then call _train_kalman on train data
-
-    def fit(self, train_data: pd.DataFrame):
-        tickers = train_data.columns
-        sector_map = sector_map(tickers,self.company_df)
-
-        self.pairs = self._get_pairs(train_data, sector_map)
+    def fit(self, train_data: pd.DataFrame, config: KalmanConfig = None):
+        self.config    = config or KalmanConfig()
+        sector_map     = get_sector_map(train_data.columns, self.company_df)
+        self.pairs     = self._get_pairs(train_data, sector_map)
         self.kf_states = {}
-
-        #fitting kalman filter over training data
-        # onyl reason we would reinitialize
-        # kalman is that in test period we wanna be using our previously used info
         self._train_kalman(train_data)
-
-        #fitting the variance factors which deal with fat tailedness of spreads
         self._fit_ddivf()
-
-        #regime fitting over training period
         self._fit_pair_hmm()
-
-        #obtaining the optimal thresholds for each regime based on maximized sharpe
         self._optimise_thresholds(train_data)
         self.is_fitted = True
 
     def evaluate(self, test_data: pd.DataFrame):
-        #so actually not much needs to be done here
         if not self.is_fitted:
             return None, None
 
-        vols         = {}
-        regimes      = {}
-        test_spread_cols = {}
-        test_beta_cols   = {}
-        test_alpha_cols  = {}
+        spread_cols, beta_cols, alpha_cols, vol_cols, regime_cols = {}, {}, {}, {}, {}
 
         for pair in self.pairs:
-            y_tick, x_tick = pair
-            if y_tick not in test_data.columns or x_tick not in test_data.columns:
-                continue
             col = pair_col(pair)
 
-            log_y = np.log(test_data[y_tick]).dropna()
-            log_x = np.log(test_data[x_tick]).dropna()
+            if not self._pair_available(pair, test_data):
+                continue
 
-            log_y, log_x = match_index(log_y=log_y,
-                                       log_x=log_x)
+            spread, betas, alphas = self._test_kalman(pair, test_data)
+            if spread is None:
+                continue
 
-            spread, betas, alphas = self._kalman_filter(
-                pair,
-                log_y,
-                log_x,
-                delta=self.kf_states[pair].delta,
-                R=self.kf_states[pair].R
-            )
+            spread_cols[col]  = spread
+            beta_cols[col]    = betas.reindex(spread.index)
+            alpha_cols[col]   = alphas.reindex(spread.index)
+            vol_cols[col]     = self._rolling_test_vols(pair, spread)
+            regime_cols[col]  = get_current_regime(*self.hmm_models[pair], spread)
 
-            spread = spread.dropna()
+        self.test_spreads = pd.DataFrame(spread_cols)
+        self.test_betas   = pd.DataFrame(beta_cols)
+        self.test_alphas  = pd.DataFrame(alpha_cols)
+        self.vols         = pd.DataFrame(vol_cols)
+        self.regimes      = pd.DataFrame(regime_cols)
 
-            #ensuring 
-            test_spread_cols[col] = spread
-            test_beta_cols[col]   = betas.reindex(spread.index)
-            test_alpha_cols[col]  = alphas.reindex(spread.index)
-
-            #get volatilities from pair
-            ddivf = self.ddivf_states[pair]
-
-            #this returns the last k volatilities -> to be used to project forward and minimized
-            # FESS error (foward Error Sum Squared)
-            buf   = ddivf.buffer.copy()
-            test_vols = np.zeros(len(spread))
-
-            #we've already calculated spread over the full test period
-            #what we did above was to take the buffer (last 100 vols)
-            # we will be using that as our buffer for the first entry in this
-            #then continually uopdatre it
-            for i in range(len(spread)):
-                _, _, sigma_dd, _ = DDIVF(pd.Series(buf))  # vol from past k obs only
-                test_vols[i]      = sigma_dd
-                buf = np.append(buf[1:], spread.values[i]) # slide window after
-
-            vols[col] = pd.Series(test_vols, index=spread.index)
-
-            model, calm_state = self.hmm_models[pair]
-            regimes[col] = get_current_regime(model, calm_state, spread)
-
-        self.test_spreads = pd.DataFrame(test_spread_cols)
-        self.test_betas   = pd.DataFrame(test_beta_cols)
-        self.test_alphas  = pd.DataFrame(test_alpha_cols)
-        self.vols         = pd.DataFrame(vols)
-        regime_df         = pd.DataFrame(regimes)
-        self.regimes = regime_df
-
-        signals = self._generate_signals(regime_df)
+        signals = self._generate_signals(self.regimes)
         weights = self._get_weights(signals)
         return weights, signals
-    
-    #we have weights throughout these periods but we need to monitor positions
-    
-    #signals vs weihgts
+
     def backtest(self, test_data: pd.DataFrame, signals: pd.DataFrame, weights: pd.DataFrame):
-        pr_dict = {}
+        idx          = self.test_spreads.index
+        pr_dict      = {}
+        pair_sharpes = {}
+
         for pair in self.pairs:
             col = pair_col(pair)
-            if col not in self.test_betas.columns:
+            if col not in self.test_betas.columns or col not in signals.columns:
                 continue
-            y, x = pair
-            ret_y  = np.log(test_data[y]).diff().reindex(self.test_betas.index)
-            ret_x  = np.log(test_data[x]).diff().reindex(self.test_betas.index)
-            hedge  = entry_beta(signals[col], self.test_betas[col])
-            pr_dict[col] = signals[col] * (ret_y - hedge * ret_x) / (1 + hedge)
-        pair_returns = pd.DataFrame(pr_dict, index=self.test_betas.index)
+            sig              = signals[col].reindex(idx).fillna(0).astype(int)
+            rets             = self._pair_pnl(pair, test_data, sig, idx)
+            pr_dict[col]     = rets
+            pair_sharpes[col] = _sharpe(rets[sig != 0])
 
-        daily_pnl  = (weights * pair_returns).sum(axis=1)
-        cumulative = daily_pnl.cumsum()
-        sharpe     = daily_pnl.mean() / daily_pnl.std() * np.sqrt(252)
-        return daily_pnl, cumulative, sharpe
+        pair_returns = pd.DataFrame(pr_dict, index=idx).fillna(0)
+        daily_pnl    = (weights.reindex(idx).fillna(0) * pair_returns).sum(axis=1)
+        return pair_returns, daily_pnl, pd.Series(pair_sharpes), _sharpe(daily_pnl)
+
+    def _pair_available(self, pair: tuple, test_data: pd.DataFrame) -> bool:
+        y, x    = pair
+        missing = [t for t in (y, x) if t not in test_data.columns]
+        if missing:
+            self.remove_missing_ticker(*missing)
+            return False
+        return pair in self.ddivf_states and pair in self.hmm_models
+
+    def _test_kalman(self, pair: tuple, test_data: pd.DataFrame):
+        """Kalman filter on test window. Returns (spread, betas, alphas) or (None, None, None)."""
+        y, x           = pair
+        log_y, log_x   = match_index(np.log(test_data[y]).dropna(), np.log(test_data[x]).dropna())
+        spread, betas, alphas = self._kalman_filter(
+            pair, log_y, log_x,
+            delta=self.kf_states[pair].delta,
+            R=self.kf_states[pair].R,
+        )
+        spread = spread.dropna()
+        return (spread, betas, alphas) 
+
+    def _rolling_test_vols(self, pair: tuple, spread: pd.Series) -> pd.Series:
+        """Slide the DDIVF buffer across the test spread to produce vol estimates."""
+        buf  = self.ddivf_states[pair].buffer.copy()
+        vols = np.zeros(len(spread))
+        for i, val in enumerate(spread.values):
+            _, _, vols[i], _ = DDIVF(buf)
+            buf = np.append(buf[1:], val)
+        return pd.Series(vols, index=spread.index)
+
+    def _pair_pnl(self, pair: tuple, test_data: pd.DataFrame,
+                  sig: pd.Series, idx: pd.Index) -> pd.Series:
+        y, x  = pair
+        ret_y = np.log(test_data[y]).diff().shift(-1).reindex(idx)
+        ret_x = np.log(test_data[x]).diff().shift(-1).reindex(idx)
+        hedge = entry_beta(sig, self.test_betas[pair_col(pair)])
+        rets  = (sig * (ret_y - hedge * ret_x) / (1 + hedge)).fillna(0)
+        rets[sig == 0] = 0.0
+        return rets
 
     def _generate_signals(self, regime_df: pd.DataFrame) -> pd.DataFrame:
-        """Vectorized signal generation over the full test window."""
         signals = {}
         for pair in self.pairs:
             col = pair_col(pair)
-            signals[col] = get_signals(
-                pair_hmm=regime_df[col],
-                pvals=self.thresholds[pair],
-                vols=self.vols[col],
-                spreads=self.test_spreads[col]
-            )
+            if col not in regime_df.columns or pair not in self.thresholds:
+                continue
+            signals[col] = self._signals_for_pair(pair, col, regime_df)
         return pd.DataFrame(signals)
 
+    def _signals_for_pair(self, pair: tuple, col: str, regime_df: pd.DataFrame) -> pd.Series:
+        spread_vals = self.test_spreads[col].dropna()
+        pair_idx    = spread_vals.index
+        spread_mean = spread_vals.ewm(halflife=self.config.ewm_halflife).mean().shift(1).fillna(0)
+        centered    = (spread_vals - spread_mean).values
+        regimes     = regime_df[col].reindex(pair_idx).fillna(0)
+        raw_signals = get_signals(
+            hmm_vals = regimes.values.astype(np.int64),
+            pvals    = self.thresholds[pair],
+            vols     = self.vols[col].loc[pair_idx].values,
+            spreads  = centered,
+        )
+        return pd.Series(raw_signals, index=pair_idx)
+
     def _get_weights(self, signals: pd.DataFrame) -> pd.DataFrame:
-        """Equal weight across all active positions. Flat when no signals."""
-        num_positions = (signals != 0).sum(axis=1).replace(0, np.nan)
-        return signals.div(num_positions, axis=0).fillna(0)
-
-    def _update(self, pair: tuple, log_y_t: float, log_x_t: float):
-        """Online Kalman update for a single pair — used in live trading."""
-        state = self.kf_states[pair]
-        H = np.array([log_x_t, 1.0])
-        return self._kalman_step(state, H, log_y_t)
-
-    
-
-    def get_pairs(self,data, sector_map):
-        self.pairs = self._get_pairs(data,sector_map)
+        num_active = (signals != 0).sum(axis=1).replace(0, np.nan)
+        return (signals != 0).astype(float).div(num_active, axis=0).fillna(0)
 
     def _get_pairs(self, data: pd.DataFrame, sector_map: dict) -> list[tuple]:
-        """Cointegration + FDR filtering to select tradeable pairs."""
         pairs_df = combination_filter(data, sector_map)
         if pairs_df.empty:
             return []
         return list(zip(pairs_df["dependent"], pairs_df["independent"]))
-    
-    def train_kalman(self, train_data: pd.DataFrame):
-        self._train_kalman(train_data=train_data)
 
     def _train_kalman(self, train_data: pd.DataFrame):
-        """Run Kalman filter over training data. Populates spreads and kf_states."""
-        #this goes through and gives us -> spreads over the train period and betas
-        self.train_betas = {}
-        self.train_alphas = {}
-        self.kf_states = {}
+        self.train_betas = {}; self.train_alphas = {}; self.kf_states = {}
         spread_cols = {}
         for pair in self.pairs:
-            y_tick, x_tick = pair
-            log_y = np.log(train_data[y_tick])
-            log_x = np.log(train_data[x_tick])
-            spread, betas, alphas = self._kalman_filter(pair, log_y, log_x)
+            y, x                   = pair
+            spread, betas, alphas  = self._kalman_filter(pair, np.log(train_data[y]), np.log(train_data[x]))
             spread_cols[pair_col(pair)] = spread
-            self.train_betas[pair] = betas
+            self.train_betas[pair]  = betas
             self.train_alphas[pair] = alphas
         self.spreads = pd.DataFrame(spread_cols)
-    
+
     def _fit_ddivf(self, k: int = 100):
         self.ddivf_states = {}
         for pair in self.pairs:
             col    = pair_col(pair)
             spread = self.spreads[col].dropna()
-
-            # one-step-ahead vol for each bar t using only [t-k : t]
-            # first k-1 bars are NaN naturally — no explicit loop needed
-            train_vols = spread.rolling(k).apply(
-                lambda w: DDIVF(pd.Series(w))[2], raw=True
-            )
-
-            # final window params carried into test period
-            alpha_final, _, sigma_final, rho_final = DDIVF(spread.iloc[-k:])
-
+            if len(spread) < k:
+                continue
+            train_vols          = spread.rolling(k).apply(lambda w: DDIVF(w)[2], raw=True)
+            alpha, _, sigma, rho = DDIVF(spread.iloc[-k:].values)
             self.ddivf_states[pair] = DDIVFState(
-                alpha      = alpha_final,
-                nu_bar     = spread.mean(),
-                rho        = rho_final,
-                vol        = sigma_final,
-                train_vols = train_vols.dropna(),
-                buffer     = spread.iloc[-k:].values.copy()
+                alpha=alpha, nu_bar=spread.mean(), rho=rho, vol=sigma,
+                train_vols=train_vols.dropna(), buffer=spread.iloc[-k:].values.copy(),
             )
 
     def _fit_pair_hmm(self):
-        """Fit Gaussian HMM on each pair's training spread."""
         self.hmm_models = {}
         for pair in self.pairs:
-            self.hmm_models[pair] = fit_hmm(self.spreads[pair_col(pair)])
+            if pair in self.ddivf_states:
+                self.hmm_models[pair] = fit_hmm(self.spreads[pair_col(pair)].dropna())
 
     def _optimise_thresholds(self, train_data: pd.DataFrame):
-        """Grid search for optimal HMM-state-dependent signal thresholds."""
         self.profit_factor = {}
-        self.thresholds = {}
+        self.thresholds    = {}
+        default            = np.array(self.config.thresholds)
+
         for pair in self.pairs:
-            y_tick, x_tick = pair
-            col = pair_col(pair)
-            model, calm_state = self.hmm_models[pair]
-            thresholds, profit_factor, _ = optimise_threshold(
-                innovations=self.spreads[col],
-                sigma_dd=self.ddivf_states[pair].train_vols,
-                hmm_states=get_current_regime(model, calm_state, self.spreads[col]),
-                log_y=np.log(train_data[y_tick]),
-                log_x=np.log(train_data[x_tick]),
-                beta=self.train_betas[pair],
-            )
-            self.profit_factor[pair] = profit_factor
-            # fall back to a neutral threshold if optimisation found no valid combos
-            if thresholds is None:
-                thresholds = {0: 1.0, 1: 1.5}
-            self.thresholds[pair] = thresholds
+            if pair not in self.ddivf_states or pair not in self.hmm_models:
+                continue
+            if not self.config.optimise_thresholds:
+                self.thresholds[pair] = default; self.profit_factor[pair] = np.nan
+                continue
+            self.thresholds[pair], self.profit_factor[pair] = \
+                self._optimise_pair_thresholds(pair, train_data, default)
+
+    def _optimise_pair_thresholds(self, pair: tuple, train_data: pd.DataFrame,
+                                   default: np.ndarray) -> tuple[np.ndarray, float]:
+        y, x              = pair
+        col               = pair_col(pair)
+        model, calm_state = self.hmm_models[pair]
+        raw               = self.spreads[col]
+        centered          = raw - raw.ewm(halflife=self.config.ewm_halflife).mean().shift(1).fillna(0)
+        thresholds, profit_factor, _ = optimise_threshold(
+            innovations = centered,
+            sigma_dd    = self.ddivf_states[pair].train_vols,
+            hmm_states  = get_current_regime(model, calm_state, centered),
+            log_y       = np.log(train_data[y]),
+            log_x       = np.log(train_data[x]),
+            beta        = self.train_betas[pair],
+        )
+        result = np.array([thresholds[s] for s in range(2)]) if thresholds is not None else default
+        return result, profit_factor
+
+    def _kalman_filter(self, pair: tuple, log_y: pd.Series, log_x: pd.Series,
+                       delta: float = None, R: float = None):
+        if delta is None or R is None:
+            delta, R = self._tune_kalman_params(log_y, log_x)
+        if pair in self.kf_states:
+            state = self.kf_states[pair]; state.Q = delta * np.eye(2); state.R = R
+        else:
+            state = KFState(x=np.zeros(2), P=np.eye(2), Q=delta * np.eye(2), R=R, delta=delta)
+            self.kf_states[pair] = state
+
+        betas, alphas = np.zeros(len(log_y)), np.zeros(len(log_y))
+        for t in range(len(log_y)):
+            self._kalman_step(state, np.array([log_x.iloc[t], 1.0]), log_y.iloc[t])
+            betas[t], alphas[t] = state.x
+        return self._build_spread(log_y, log_x, betas, alphas)
 
     def _kalman_step(self, state: KFState, H: np.ndarray, y: float):
-        """Single predict-update step. Mutates state in place. Returns (nu, S)."""
         state.P = state.P + state.Q
-        nu = y - H @ state.x
-        #S can be thought of as the uncertainty for this time around
-        # so generally if we have a very high S -> trust our 
-        # trust prediction or trust measurement?
-        S  = float(H @ state.P @ H.T + state.R)
+        nu      = y - H @ state.x
+        S       = float(H @ state.P @ H.T + state.R)
         if S <= 0:
             return nu, S
         K       = (state.P @ H) / S
@@ -357,67 +336,34 @@ class KalmanPairs(Strategy):
         state.P = I_KH @ state.P @ I_KH.T + state.R * np.outer(K, K)
         return nu, S
 
-    #kf_states only reinitialized in train_kalman
-    def _kalman_filter(self, pair: tuple, log_y: pd.Series, log_x: pd.Series,
-                       delta: float = None, R: float = None):
-        """Run filter over a full price series. Stores final state in kf_states[pair].
-
-        If kf_states[pair] already exists (i.e. called during evaluation after training),
-        warm-starts from the trained state rather than reinitialising from zero.
-        """
-        if delta is None or R is None:
-            delta, R = self._tune_kalman_params(log_y, log_x)
-
-        #kf_states should be reinitialized in train period NOT TEST
-        if pair in self.kf_states:
-            # warm-start: keep trained x and P, just update Q/R if needed
-            state = self.kf_states[pair]
-            state.Q = delta * np.eye(2)
-            state.R = R
-        else:
-            state = KFState(x=np.zeros(2), P=np.eye(2), Q=delta * np.eye(2), R=R, delta=delta)
-            self.kf_states[pair] = state
-
-        betas  = np.zeros(len(log_y))
-        alphas = np.zeros(len(log_y))
-        for t in range(len(log_y)):
-            H = np.array([log_x.iloc[t], 1.0])
-            self._kalman_step(state, H, log_y.iloc[t])
-            betas[t], alphas[t] = state.x
-
-        return self._build_spread(log_y, log_x, betas, alphas)
-
-    def _kalman_LL(self, params, log_y: pd.Series, log_x: pd.Series) -> float:
-        """Negative log-likelihood for Kalman parameter tuning."""
-        delta, R = np.exp(params[0]), np.exp(params[1])
-        state = KFState(x=np.zeros(2), P=np.eye(2), Q=delta * np.eye(2), R=R, delta=delta)
-        ll = 0.0
-        for t in range(len(log_y)):
-            H = np.array([log_x.iloc[t], 1.0])
-            nu, S = self._kalman_step(state, H, log_y.iloc[t])
-            if S <= 0:
-                return 1e10
-            ll += -0.5 * (np.log(S) + nu ** 2 / S)
-        return -ll
-
-    def _tune_kalman_params(self, log_y: pd.Series, log_x: pd.Series):
-        """MLE optimisation of delta and R via L-BFGS-B."""
+    def _tune_kalman_params(self, log_y: pd.Series, log_x: pd.Series) -> tuple[float, float]:
         result = minimize(
-            self._kalman_LL,
+            lambda p: _kalman_ll_core(log_y.values, log_x.values, np.exp(p[0]), np.exp(p[1])),
             x0=[np.log(1e-4), np.log(1.0)],
-            args=(log_y, log_x),
             method='L-BFGS-B',
-            bounds=[(np.log(1e-6), np.log(1e-1)),
-                    (np.log(1e-3), np.log(100.0))],
-            options={'maxiter': 1000}
+            bounds=[(np.log(1e-6), np.log(1e-1)), (np.log(1e-3), np.log(100.0))],
+            options={'maxiter': 1000},
         )
         return np.exp(result.x[0]), np.exp(result.x[1])
 
     @staticmethod
     def _build_spread(log_y: pd.Series, log_x: pd.Series,
                       betas: np.ndarray, alphas: np.ndarray):
-        """Construct spread using lagged beta/alpha to avoid lookahead."""
+        """Lagged beta/alpha avoids lookahead — first bar is always NaN."""
         beta_s  = pd.Series(betas,  index=log_y.index)
         alpha_s = pd.Series(alphas, index=log_y.index)
-        spread  = log_y - beta_s.shift(1) * log_x - alpha_s.shift(1)
+        spread  = (log_y - beta_s.shift(1) * log_x - alpha_s.shift(1)).dropna()
         return spread, beta_s, alpha_s
+
+    def remove_missing_ticker(self, tick_a: str, tick_b: str = None):
+        to_remove = {tick_a, tick_b} if tick_b else {tick_a}
+        self.pairs = [p for p in self.pairs if not (p[0] in to_remove or p[1] in to_remove)]
+
+    def preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df.dropna(axis=1, how='all')
+
+
+def _sharpe(returns: pd.Series) -> float:
+    if len(returns) < 2 or returns.std() == 0:
+        return 0.0
+    return float(returns.mean() / returns.std() * np.sqrt(252))
