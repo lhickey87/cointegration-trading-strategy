@@ -40,7 +40,6 @@ class Backtest():
             train_data = self.strategy.preprocess(fold['train'])
             test_data  = self.strategy.preprocess(fold['test'])
 
-            print(f"Fitting over: {get_years(train_data.index)}")
             self.strategy.fit(train_data)
 
             year = get_year(index=test_data.index)

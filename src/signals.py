@@ -11,10 +11,11 @@ def _shift(arr):
     out[1:] = arr[:-1]
     return out
 
-#should also probably look into the performance across different stop_z and exit_z
-
+#the issue right now is that spreads is calculated via changing beta 
+#instead we need beta to be fixed when we enter a position
 @njit
-def get_signals(hmm_vals, pvals, vols, spreads, stop_z=4, exit_z=0.5):
+def get_signals(hmm_vals, pvals, vols, spreads, log_y, log_x, betas_shifted,
+                stop_z=3.0, exit_z=0.0):
     hmm_prev         = _shift(hmm_vals)
     vols_prev        = _shift(vols)
 
@@ -23,22 +24,27 @@ def get_signals(hmm_vals, pvals, vols, spreads, stop_z=4, exit_z=0.5):
 
     upper_t          = threshold_t * vols
     upper_prev_t     = threshold_prev_t * vols_prev
-
     exit_band        = exit_z * vols
     stop_band        = stop_z * vols
 
-    position = 0
+    position    = 0
+    beta_entered = 0.0
     out = np.zeros(len(spreads), dtype=np.int8)
 
     for i in range(1, len(spreads)):
         if position != 0:
-            if abs(spreads[i]) < exit_band[i] or abs(spreads[i]) > stop_band[i]:
+            spread_held_i = log_y[i] - beta_entered * log_x[i]
+            if abs(spread_held_i) < exit_band[i] or abs(spread_held_i) > stop_band[i]:
                 position = 0
-        else:
-            if spreads[i] > upper_t[i] and spreads[i-1] < upper_prev_t[i]:
-                position = -1
-            elif spreads[i] < -upper_t[i] and spreads[i-1] > -upper_prev_t[i]:
-                position = 1
+        
+        if position == 0:
+            if spreads[i] > upper_t[i] and spreads[i-1] < upper_prev_t[i-1]:
+                position      = -1
+                beta_entered  = betas_shifted[i]
+            elif spreads[i] < -upper_t[i] and spreads[i-1] > -upper_prev_t[i-1]:
+                position      = 1
+                beta_entered  = betas_shifted[i]
+
         out[i] = position
 
     return out

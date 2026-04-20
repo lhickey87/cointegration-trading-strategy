@@ -13,6 +13,8 @@ from signals import optimise_threshold, get_signals
 from universe import get_sector_map
 from numba import njit
 
+TRANSACTION_COST = 0.001
+
 def entry_beta(signals: pd.Series, betas: pd.Series) -> pd.Series:
     """Beta locked in at trade entry, held constant for the duration."""
     result    = pd.Series(0.0, index=signals.index)
@@ -48,6 +50,7 @@ class KalmanConfig:
     ewm_halflife:        int             = 20
     optimise_thresholds: bool            = True
     thresholds:          tuple[float, float] = (0.7, 1.5)  # fallback / fixed thresholds
+    use_hmm: bool             = True          # ← new
 
 @dataclass
 class KFState:
@@ -77,10 +80,10 @@ _kalman_ll_core(np.ones(10, dtype=np.float64), np.ones(10, dtype=np.float64), 1e
 
 class KalmanPairs(Strategy):
 
-    def __init__(self, price_data: pd.DataFrame, company_df: pd.DataFrame):
+    def __init__(self, price_data: pd.DataFrame, company_df: pd.DataFrame,config: KalmanConfig = None):
         super().__init__(name="pairs", price_data=price_data)
         self.company_df    = company_df
-        self.config        = KalmanConfig()
+        self.config        = config or KalmanConfig()
         self.pairs:        list[tuple]             = []
         self.kf_states:    dict[tuple, KFState]    = {}
         self.train_betas:  dict[tuple, pd.Series]  = {}
@@ -112,14 +115,14 @@ class KalmanPairs(Strategy):
     def alphas(self) -> dict:
         return {pair: state.x[1] for pair, state in self.kf_states.items()}
 
-    def fit(self, train_data: pd.DataFrame, config: KalmanConfig = None):
-        self.config    = config or KalmanConfig()
+    def fit(self, train_data: pd.DataFrame):
         sector_map     = get_sector_map(train_data.columns, self.company_df)
         self.pairs     = self._get_pairs(train_data, sector_map)
         self.kf_states = {}
         self._train_kalman(train_data)
         self._fit_ddivf()
-        self._fit_pair_hmm()
+        if self.config.use_hmm:
+            self._fit_pair_hmm()
         self._optimise_thresholds(train_data)
         self.is_fitted = True
 
@@ -136,14 +139,15 @@ class KalmanPairs(Strategy):
                 continue
 
             spread, betas, alphas = self._test_kalman(pair, test_data)
-            if spread is None:
+            if spread is None or spread.dropna().empty:
                 continue
 
             spread_cols[col]  = spread
             beta_cols[col]    = betas.reindex(spread.index)
             alpha_cols[col]   = alphas.reindex(spread.index)
             vol_cols[col]     = self._rolling_test_vols(pair, spread)
-            regime_cols[col]  = get_current_regime(*self.hmm_models[pair], spread)
+            if self.config.use_hmm:
+                regime_cols[col] = get_current_regime(*self.hmm_models[pair], spread)
 
         self.test_spreads = pd.DataFrame(spread_cols)
         self.test_betas   = pd.DataFrame(beta_cols)
@@ -151,7 +155,7 @@ class KalmanPairs(Strategy):
         self.vols         = pd.DataFrame(vol_cols)
         self.regimes      = pd.DataFrame(regime_cols)
 
-        signals = self._generate_signals(self.regimes)
+        signals = self._generate_signals(self.regimes, test_data)
         weights = self._get_weights(signals)
         return weights, signals
 
@@ -164,13 +168,15 @@ class KalmanPairs(Strategy):
             col = pair_col(pair)
             if col not in self.test_betas.columns or col not in signals.columns:
                 continue
-            sig              = signals[col].reindex(idx).fillna(0).astype(int)
-            rets             = self._pair_pnl(pair, test_data, sig, idx)
-            pr_dict[col]     = rets
-            pair_sharpes[col] = _sharpe(rets[sig != 0])
+            sig             = signals[col].reindex(idx).fillna(0).astype(int)
+            rets            = self._pair_pnl(pair, test_data, sig, idx)
+            pr_dict[col]    = rets
+            active_rets     = rets[sig!= 0]
+            pair_sharpes[col] = _sharpe(active_rets)
 
         pair_returns = pd.DataFrame(pr_dict, index=idx).fillna(0)
         daily_pnl    = (weights.reindex(idx).fillna(0) * pair_returns).sum(axis=1)
+
         return pair_returns, daily_pnl, pd.Series(pair_sharpes), _sharpe(daily_pnl)
 
     def _pair_available(self, pair: tuple, test_data: pd.DataFrame) -> bool:
@@ -179,7 +185,11 @@ class KalmanPairs(Strategy):
         if missing:
             self.remove_missing_ticker(*missing)
             return False
-        return pair in self.ddivf_states and pair in self.hmm_models
+        if pair not in self.ddivf_states:
+            return False
+        if self.config.use_hmm and pair not in self.hmm_models:
+            return False
+        return True
 
     def _test_kalman(self, pair: tuple, test_data: pd.DataFrame):
         """Kalman filter on test window. Returns (spread, betas, alphas) or (None, None, None)."""
@@ -203,32 +213,54 @@ class KalmanPairs(Strategy):
         return pd.Series(vols, index=spread.index)
 
     def _pair_pnl(self, pair: tuple, test_data: pd.DataFrame,
-                  sig: pd.Series, idx: pd.Index) -> pd.Series:
+                  signals: pd.Series, idx: pd.Index) -> pd.Series:
         y, x  = pair
         ret_y = np.log(test_data[y]).diff().shift(-1).reindex(idx)
         ret_x = np.log(test_data[x]).diff().shift(-1).reindex(idx)
-        hedge = entry_beta(sig, self.test_betas[pair_col(pair)])
-        rets  = (sig * (ret_y - hedge * ret_x) / (1 + hedge)).fillna(0)
-        rets[sig == 0] = 0.0
+        hedge = entry_beta(signals, self.test_betas[pair_col(pair)])
+        TC = TRANSACTION_COST
+        #now in this case we are using ret_y - hedge * ret_x -> should we also subtract alpha?
+        signal_change = signals.diff().abs().fillna(signals.abs())
+
+        rets  = (signals * (ret_y - hedge * ret_x) / (1 + hedge)).fillna(0)
+        #TRANSACTION COSTS
+        #this is wayyy too many transaction costs we wouldnt actually be tradingt this much
+        rets = rets - TC * signal_change
+        rets[signals == 0] = 0.0
         return rets
 
-    def _generate_signals(self, regime_df: pd.DataFrame) -> pd.DataFrame:
+    def _generate_signals(self, regime_df: pd.DataFrame, test_data: pd.DataFrame) -> pd.DataFrame:
         signals = {}
         for pair in self.pairs:
             col = pair_col(pair)
-            if col not in regime_df.columns or pair not in self.thresholds:
+            if pair not in self.thresholds:
                 continue
-            signals[col] = self._signals_for_pair(pair, col, regime_df)
+            if col not in self.test_spreads.columns:
+                continue
+            if self.config.use_hmm and col not in regime_df.columns:
+                continue
+            signals[col] = self._signals_for_pair(pair, regime_df, test_data)
         return pd.DataFrame(signals)
+    
+    #find price_series
 
-    def _signals_for_pair(self, pair: tuple, col: str, regime_df: pd.DataFrame) -> pd.Series:
-        spread_vals = self.test_spreads[col].dropna()
+    def _signals_for_pair(self, pair: tuple, regime_df: pd.DataFrame, test_data: pd.DataFrame) -> pd.Series:
+        col = pair_col(pair)
+        log_y = np.log(test_data[pair[0]]) #this should be an nparray
+        log_x = np.log(test_data[pair[1]])
+        # spread_vals = self.test_spreads[col].dropna()
         pair_idx    = spread_vals.index
-        spread_mean = spread_vals.ewm(halflife=self.config.ewm_halflife).mean().shift(1).fillna(0)
-        centered    = (spread_vals - spread_mean).values
-        regimes     = regime_df[col].reindex(pair_idx).fillna(0)
+        # spread_mean = spread_vals.ewm(halflife=self.config.ewm_halflife).mean().shift(1).fillna(0)
+        # centered    = (spread_vals - spread_mean).values
+
+        if self.config.use_hmm:
+            hmm_vals = regime_df[col].reindex(pair_idx).fillna(0).values.astype(np.int64)
+        else:
+            hmm_vals = np.zeros(len(pair_idx), dtype=np.int64)  # single state
+
+        #nvm we do actually pass in the demeaned spreads 
         raw_signals = get_signals(
-            hmm_vals = regimes.values.astype(np.int64),
+            hmm_vals = hmm_vals,
             pvals    = self.thresholds[pair],
             vols     = self.vols[col].loc[pair_idx].values,
             spreads  = centered,
@@ -239,10 +271,12 @@ class KalmanPairs(Strategy):
         num_active = (signals != 0).sum(axis=1).replace(0, np.nan)
         return (signals != 0).astype(float).div(num_active, axis=0).fillna(0)
 
-    def _get_pairs(self, data: pd.DataFrame, sector_map: dict) -> list[tuple]:
-        pairs_df = combination_filter(data, sector_map)
+    def _get_pairs(self, data: pd.DataFrame, sector_map: dict, use_rmt: bool = False) -> list[tuple]:
+        pairs_df = combination_filter(data, sector_map, use_rmt=use_rmt)
         if pairs_df.empty:
+            self.pairs_df = pd.DataFrame()
             return []
+        self.pairs_df = pairs_df
         return list(zip(pairs_df["dependent"], pairs_df["independent"]))
 
     def _train_kalman(self, train_data: pd.DataFrame):
@@ -263,11 +297,17 @@ class KalmanPairs(Strategy):
             spread = self.spreads[col].dropna()
             if len(spread) < k:
                 continue
+
             train_vols          = spread.rolling(k).apply(lambda w: DDIVF(w)[2], raw=True)
+
             alpha, _, sigma, rho = DDIVF(spread.iloc[-k:].values)
+
             self.ddivf_states[pair] = DDIVFState(
-                alpha=alpha, nu_bar=spread.mean(), rho=rho, vol=sigma,
-                train_vols=train_vols.dropna(), buffer=spread.iloc[-k:].values.copy(),
+                alpha=alpha, 
+                nu_bar=spread.mean(), 
+                rho=rho, vol=sigma,
+                train_vols=train_vols.dropna(), 
+                buffer=spread.iloc[-k:].values.copy(),
             )
 
     def _fit_pair_hmm(self):
@@ -279,32 +319,43 @@ class KalmanPairs(Strategy):
     def _optimise_thresholds(self, train_data: pd.DataFrame):
         self.profit_factor = {}
         self.thresholds    = {}
-        default            = np.array(self.config.thresholds)
+
+        default = np.array(self.config.thresholds)
 
         for pair in self.pairs:
-            if pair not in self.ddivf_states or pair not in self.hmm_models:
+            if pair not in self.ddivf_states:
+                continue
+            if self.config.use_hmm and pair not in self.hmm_models:
                 continue
             if not self.config.optimise_thresholds:
-                self.thresholds[pair] = default; self.profit_factor[pair] = np.nan
+                self.thresholds[pair]    = default
+                self.profit_factor[pair] = np.nan
                 continue
             self.thresholds[pair], self.profit_factor[pair] = \
                 self._optimise_pair_thresholds(pair, train_data, default)
 
     def _optimise_pair_thresholds(self, pair: tuple, train_data: pd.DataFrame,
                                    default: np.ndarray) -> tuple[np.ndarray, float]:
-        y, x              = pair
-        col               = pair_col(pair)
-        model, calm_state = self.hmm_models[pair]
-        raw               = self.spreads[col]
-        centered          = raw - raw.ewm(halflife=self.config.ewm_halflife).mean().shift(1).fillna(0)
+        y, x     = pair
+        col      = pair_col(pair)
+        raw      = self.spreads[col]
+        centered = raw - raw.ewm(halflife=self.config.ewm_halflife).mean().shift(1).fillna(0)
+
+        if self.config.use_hmm:
+            model, calm_state = self.hmm_models[pair]
+            hmm_states = get_current_regime(model, calm_state, centered)
+        else:
+            hmm_states = pd.Series(0, index=centered.index)  # single state — no regime
+
         thresholds, profit_factor, _ = optimise_threshold(
             innovations = centered,
             sigma_dd    = self.ddivf_states[pair].train_vols,
-            hmm_states  = get_current_regime(model, calm_state, centered),
+            hmm_states  = hmm_states,
             log_y       = np.log(train_data[y]),
             log_x       = np.log(train_data[x]),
             beta        = self.train_betas[pair],
         )
+
         result = np.array([thresholds[s] for s in range(2)]) if thresholds is not None else default
         return result, profit_factor
 
@@ -312,8 +363,11 @@ class KalmanPairs(Strategy):
                        delta: float = None, R: float = None):
         if delta is None or R is None:
             delta, R = self._tune_kalman_params(log_y, log_x)
+
         if pair in self.kf_states:
-            state = self.kf_states[pair]; state.Q = delta * np.eye(2); state.R = R
+            state = self.kf_states[pair] 
+            state.Q = delta * np.eye(2) 
+            state.R = R
         else:
             state = KFState(x=np.zeros(2), P=np.eye(2), Q=delta * np.eye(2), R=R, delta=delta)
             self.kf_states[pair] = state
@@ -346,6 +400,8 @@ class KalmanPairs(Strategy):
         )
         return np.exp(result.x[0]), np.exp(result.x[1])
 
+    #the spread is actually calculated via the alpha_s
+    #so if we deamean we are effectively taking 
     @staticmethod
     def _build_spread(log_y: pd.Series, log_x: pd.Series,
                       betas: np.ndarray, alphas: np.ndarray):
@@ -367,3 +423,8 @@ def _sharpe(returns: pd.Series) -> float:
     if len(returns) < 2 or returns.std() == 0:
         return 0.0
     return float(returns.mean() / returns.std() * np.sqrt(252))
+
+
+#where would the issue come in is my question. calc spread via log_y - beta.shift(1)*log_x - alpha
+# then in signals we actually use a demeaned version
+# so we aren't actually getting a good idea of the spread without subtracting alpha away? 
